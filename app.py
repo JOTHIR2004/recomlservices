@@ -1,22 +1,23 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from pymongo import MongoClient
-from sentence_transformers import SentenceTransformer
 import faiss
 import os
 from dotenv import load_dotenv
 import numpy as np
+import requests
 
+# ================= INIT =================
 app = FastAPI()
-load_dotenv() 
+load_dotenv()
 
+# ================= ENV VARIABLES =================
 MONGO_URI = os.getenv("MONGO_URI")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-# MongoDB
-MONGO_URI = "mongodb+srv://srimaniram_db_user:jothir1234@cluster0.nsmhmzs.mongodb.net/?appName=Cluster0"
+# ================= MONGODB =================
 client = MongoClient(MONGO_URI)
 
-# 🔍 CONNECTION CHECK
 try:
     client.admin.command("ping")
     print("✅ MongoDB connected successfully (FastAPI)")
@@ -26,59 +27,85 @@ except Exception as e:
 db = client["test"]
 signups = db["signups"]
 
-# ================= ML MODEL =================
-model = SentenceTransformer("all-mpnet-base-v2")
+# ================= HUGGING FACE API =================
+API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-mpnet-base-v2/pipeline/feature-extraction"
+
+
+HEADERS = {
+    "Authorization": f"Bearer {HF_TOKEN}",
+}
+
+def get_embedding(texts):
+    response = requests.post(
+        API_URL,
+        headers=HEADERS,
+        json={
+            "inputs": texts
+        },
+    )
+
+    if response.status_code != 200:
+        raise Exception(f"HuggingFace API Error: {response.text}")
+
+    embeddings = response.json()
+
+    return np.array(embeddings).astype("float32")
+
 
 # ================= REQUEST MODEL =================
 class SuggestRequest(BaseModel):
     studentSkills: str
     studentAoi: str
 
+
 # ================= API ENDPOINT =================
 @app.post("/suggest")
 def suggest_alumni(req: SuggestRequest):
+
     print("📥 Incoming request:", req)
 
-    # 🔍 TEMP: Fetch ALL documents to confirm data exists
+    # Fetch alumni only
     alumni_list = list(signups.find({"role": "alumni"}))
-    print("📊 Total documents in signups:", len(alumni_list))
 
-    # 🔍 TEMP: Print role values (first 5 docs)
-    for a in alumni_list[:5]:
-        print("👤 Role value:", a.get("role"))
+    print("📊 Total alumni found:", len(alumni_list))
 
     if not alumni_list:
         return []
 
-    # ================= EMBEDDINGS =================
+    # ================= PREPARE TEXT =================
     alumni_texts = [
         f"{a.get('skills','')} {a.get('areaOfInterest','')} {a.get('about','')}"
         for a in alumni_list
     ]
 
-    alumni_embeddings = model.encode(alumni_texts, convert_to_numpy=True)
+    # ================= GET EMBEDDINGS FROM HF =================
+    alumni_embeddings = get_embedding(alumni_texts)
+
+    # Normalize vectors for cosine similarity
     faiss.normalize_L2(alumni_embeddings)
 
-    query_vec = model.encode(
-        [f"{req.studentSkills} {req.studentAoi}"],
-        convert_to_numpy=True
-    )
+    query_text = f"{req.studentSkills} {req.studentAoi}"
+    query_vec = get_embedding([query_text])
+
     faiss.normalize_L2(query_vec)
 
-    index = faiss.IndexFlatIP(alumni_embeddings.shape[1])
+    # ================= FAISS INDEX =================
+    dimension = alumni_embeddings.shape[1]
+    index = faiss.IndexFlatIP(dimension)  # Inner product (cosine similarity)
     index.add(alumni_embeddings)
 
     D, I = index.search(query_vec, len(alumni_list))
 
-    # ================= RESULTS =================
+    # ================= FILTER RESULTS =================
     threshold = 0.15
     results = []
 
-    for i, score in zip(I[0], D[0]):
+    for idx, score in zip(I[0], D[0]):
         if score < threshold:
             continue
 
-        alumni = alumni_list[i]
+        alumni = alumni_list[idx]
+
         results.append({
             "_id": str(alumni["_id"]),
             "firstName": alumni.get("firstName"),
@@ -90,3 +117,9 @@ def suggest_alumni(req: SuggestRequest):
         })
 
     return sorted(results, key=lambda x: x["similarity"], reverse=True)
+
+
+# ================= ROOT TEST =================
+@app.get("/")
+def home():
+    return {"message": "Alumni Suggestion API Running 🚀"}
